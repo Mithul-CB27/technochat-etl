@@ -15,8 +15,15 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, "etl.env"))
 
-SOURCE_DB_URL = os.getenv("DO_DB_URL")
 TARGET_DB_URL = os.getenv("TARGET_DB_URL")
+SOURCE_PASS   = os.getenv("SOURCE_DB_PASSWORD")
+
+SOURCE_DB_URL = (
+    "postgresql://doadmin:{password}"
+    "@db-postgresql-blr1-99203-do-user-14584069-0.b.db.ondigitalocean.com"
+    ":25060/technosport-prod"
+    "?sslmode=require"
+).format(password=SOURCE_PASS)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_path = os.path.join(BASE_DIR, "etl.log")
@@ -43,6 +50,7 @@ SELECT
   (o.delivered_at::date + INTERVAL '1 day')::date   AS delivered_date,
   c.id                                              AS customer_id,
   c.first_name                                      AS retailer_name,
+  c.phone                                           AS contact,
   p.ts_style                                        AS style,
   pv.id                                             AS variant_id,
   p.id                                              AS product_id,
@@ -137,16 +145,12 @@ ORDER BY p.id, pv.id
 
 def get_engines():
     log.info("Connecting to DigitalOcean PostgreSQL...")
-    if not SOURCE_DB_URL:
-        raise ValueError("DO_DB_URL environment variable is not set")
     source = create_engine(
         SOURCE_DB_URL,
         connect_args={"connect_timeout": 30, "sslmode": "require"},
         pool_pre_ping=True,
     )
     log.info("Connecting to Supabase...")
-    if not TARGET_DB_URL:
-        raise ValueError("TARGET_DB_URL environment variable is not set")
     target = create_engine(
         TARGET_DB_URL,
         connect_args={"connect_timeout": 30},
@@ -242,6 +246,7 @@ def extract_products(source_engine) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def clean_dataframe(df: pd.DataFrame, table_name: str) -> pd.DataFrame:
+    # Normalise column names
     df.columns = [c.lower().strip().replace(" ", "_") for c in df.columns]
 
     if table_name == "orders":
@@ -260,6 +265,7 @@ def clean_dataframe(df: pd.DataFrame, table_name: str) -> pd.DataFrame:
                 df[col] = df[col].astype(str).str.strip()
                 df[col] = df[col].replace({"nan": None, "None": None, "": None})
 
+        # Drop duplicate (order_id, variant_id) rows — keep last
         before = len(df)
         df = df.drop_duplicates(subset=["order_id", "variant_id"], keep="last")
         if len(df) < before:
@@ -278,7 +284,9 @@ def clean_dataframe(df: pd.DataFrame, table_name: str) -> pd.DataFrame:
                 df[col] = df[col].astype(str).str.strip()
                 df[col] = df[col].replace({"nan": None, "None": None, "": None})
 
+    # Replace all remaining NaN / NaT with None
     df = df.where(pd.notnull(df), other=None)
+
     log.info(f"[{table_name}] Clean done — {len(df):,} rows ready")
     return df
 
@@ -297,6 +305,7 @@ def pg_type(dtype) -> str:
 
 
 def ensure_main_table(table_name, df, pk_cols, target_engine):
+    """Create main table with PK if it doesn't exist yet."""
     col_defs = ", ".join([f'"{c}" {pg_type(df[c].dtype)}' for c in df.columns])
     conflict  = ", ".join([f'"{c}"' for c in pk_cols])
     with target_engine.begin() as conn:
@@ -310,6 +319,13 @@ def ensure_main_table(table_name, df, pk_cols, target_engine):
 
 
 def load_orders(df: pd.DataFrame, target_engine) -> int:
+    """
+    1. Ensure main table exists with PK (order_id, variant_id)
+    2. Write to staging table via pandas (no constraints, fast)
+    3. DELETE rows from main where PK matches staging
+    4. INSERT all staging rows into main
+    5. Drop staging
+    """
     pk_cols  = ["order_id", "variant_id"]
     cols     = list(df.columns)
     col_list = ", ".join([f'"{c}"' for c in cols])
@@ -349,6 +365,7 @@ def load_orders(df: pd.DataFrame, target_engine) -> int:
 
 
 def load_products(df: pd.DataFrame, target_engine) -> int:
+    """Full replace every run — products table is small."""
     df.to_sql(
         name="products",
         con=target_engine,
