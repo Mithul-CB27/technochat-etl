@@ -22,6 +22,5 @@ jobs:
       - name: Run ETL
         env:
           DO_DB_URL: ${{ secrets.DO_DB_URL }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TARGET_DB_URL: ${{ secrets.TARGET_DB_URL }}
         run: python etl.py
